@@ -43,6 +43,21 @@ def env(name, default=''):
     return os.environ.get(name) or default
 
 
+def ini_value(key, default=''):
+    """A key's value from bbport.ini (the game menu's settings file), `default` when absent."""
+    try:
+        for line in (ROOT / 'bbport.ini').read_text(encoding='utf-8', errors='replace').splitlines():
+            line = line.strip()
+            if line.startswith('#'):
+                continue
+            name, separator, value = line.partition('=')
+            if separator and name.strip() == key:
+                return value.strip() or default
+    except OSError:
+        pass
+    return default
+
+
 def exit_status(code):
     """A child's status as a shell reports it (128 + the signal that ended it)."""
     return 128 - code if code < 0 else code
@@ -335,6 +350,10 @@ def main():
             # MSYS2's DLLs (libc++, SDL3, FFmpeg, ...). System32 is searched before PATH, so the
             # Vulkan loader stays the one installed with the GPU driver.
             os.environ['PATH'] = os.pathsep.join([str(msys_root() / 'clang64/bin'), os.environ.get('PATH', '')])
+            # The window is created fullscreen from BB_FULLSCREEN alone, but the menu stores the
+            # choice as bbport.ini's fullscreen= line: apply it so a boot honors the setting.
+            if not env('BB_FULLSCREEN'):
+                os.environ['BB_FULLSCREEN'] = ini_value('fullscreen', '1')
         if os.environ.get('BB_DRY_RUN') == '1':
             describe_dry_run(command, probe)
             return 0
