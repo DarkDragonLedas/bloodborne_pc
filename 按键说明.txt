@@ -1,0 +1,77 @@
+════════════════════════════════════════════════════════════════════
+  血源诅咒 PC(Windows 移植版)按键说明
+  版本: 0.51 windows-port · 更新: 2026-10-11
+  键鼠和手柄可以同时使用,随时切换
+════════════════════════════════════════════════════════════════════
+
+【怎么开始玩(鼠标视角)】
+  · 进入游戏后,在游戏画面上"点击一下"鼠标 → 鼠标被捕获,移动鼠标即转视角
+    (捕获的那一下点击不会被当成攻击,放心点)
+  · 按 F1 或切出窗口 → 释放鼠标(去干别的事)
+  · 鼠标转视角速度在 bbport.ini 里 mouse_sensitivity=(0.05~20,已设 2)
+
+【战斗键位一览】(亚版习惯:○=确认/互动,✕=取消/闪避)
+
+  手柄按键      键盘          鼠标            常用用途
+  ─────────────────────────────────────────────────────────
+  ✕ 叉         左Shift       -               闪避(长按=冲刺)/ 取消
+  ○ 圈         空格          -               互动、确认(开门/拾取/对话)
+  □ 方块       E             -               使用道具(血瓶等,方向键↓切换)
+  △ 三角       Q             -               变形攻击
+  L1           1             侧键后(X2)      武器变形(招牌动作)
+  R1           3             左键            轻攻击
+  L2           R             右键            左手枪击
+  R2           F             侧键前(X1)      重攻击
+  L3 左摇杆按   Z             -               -
+  R3 右摇杆按   C             中键            锁定/解除锁定目标
+  Options      回车          -               暂停菜单
+  触摸板       Tab           -               地图等
+  触摸板右半   Backspace     -               -
+
+【移动与菜单导航】
+
+  手柄按键      键盘          鼠标
+  ─────────────────────────────────────────
+  左摇杆(移动)  W/A/S/D       -
+  右摇杆(视角)  方向键↑↓←→    移动鼠标(捕获时)
+  十字键 上/下  I / K         滚轮上 / 滚轮下
+  十字键 左/右  J / L         -
+
+【移植设置菜单(画质、超分、全屏等)】
+  · 打开: 按 Insert 键(或手柄 L3+R3)
+  · 里面可改: FSR3 超分/锐化、输出分辨率、FPS 显示、全屏开关、
+    各类特效(景深/动态模糊/SSAO 等)、跳过片头
+  · 改完写入 bbport.ini,下次启动自动生效
+
+【画面/全屏(已帮你配好)】
+  · 全屏: bbport.ini 里 fullscreen=1,启动自动全屏铺满屏幕
+  · 输出分辨率: output_res=1920x1080(FSR3 超分输出,全屏自动拉伸,
+    你的 2048x1152 屏看不出差别);想改在 Insert 菜单里调
+
+【手柄】
+  · 直接支持;L3/R3 失灵的老问题 → 用 Steam 里添加的
+    "Bloodborne PC.exe" 启动游戏即可(Steam Input 会补全按键)
+
+【自定义键位(bbport.ini,保存后重启游戏生效)】
+  格式: key.动作=键名  (多个键用逗号隔开,最多 4 个)
+  例:   key.circle=space          空格=○
+        key.r1=3,Mouse Left       3 和鼠标左键都=R1
+
+  键盘键名(小写): 字母数字 a~z 0~9 · space(空格) · leftshift / rightshift
+    · return(回车) · tab · backspace · up / down / left / right(方向键)
+  鼠标键名: Mouse Left / Mouse Right / Mouse Middle / Mouse X1(侧键前) /
+    Mouse X2(侧键后) / Wheel Up / Wheel Down(滚轮)
+  动作名: cross circle square triangle l1 r1 l2 r2 l3 r3 options touchpad
+    up down left right move_up move_down move_left move_right
+    look_up look_down look_left look_right
+  手柄改绑: pad.动作=手柄键名(SDL 名,如 south east north west
+    leftshoulder rightshoulder leftstick rightstick start back)
+
+【本机已做的自定义】(在 bbport.ini 里,可随时改回)
+  key.cross=leftshift      ✕=左Shift(亚版:空格留给确认)
+  key.circle=space         ○=空格(确认)
+  mouse_sensitivity=2      鼠标视角速度 2 倍
+  fullscreen=1             全屏启动
+════════════════════════════════════════════════════════════════════
+  游戏内具体招式操作以游戏内教程/提示为准,祝狩猎愉快!
+════════════════════════════════════════════════════════════════════
