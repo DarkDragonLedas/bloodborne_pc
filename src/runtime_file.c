@@ -382,6 +382,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     int fd=-1;
     for (int i=3;i<MAX_FILES;++i) if (!files[i].used) { fd=i; break; }
     if (fd<0) { host_unlock(&lock); if (host>=0) close(host); free_listing(dir); if (temp) unlink(temp); free(commit); free(temp); return -EMFILE; }
+    files[fd]=(File){.used=1,.host=host,.dir=dir,.commit=commit,.temp=temp};
     snprintf(files[fd].path,sizeof(files[fd].path),"%s",guest);
     ++opens;
     host_unlock(&lock);

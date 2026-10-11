@@ -669,6 +669,11 @@ static char **main_argv;
 static unsigned __stdcall loader_thread(void *unused) { (void)unused; return (unsigned)loader_main(main_argc, main_argv); }
 int main(int argc, char **argv) {
     timeBeginPeriod(1); /* 1 ms waits for timed locks and sleeps outside runtime_sleep_ns */
+    /* A cache-cold boot opens more files than the 8192 descriptors the UCRT allows by
+     * default: open() then fails with EMFILE inside the asset loaders and the game
+     * spins forever on a black window. The ceiling is per process, so this covers the
+     * runtime and the GPU DLL alike. */
+    _setmaxstdio(65535);
     /* No EcoQoS: Windows 11 otherwise moves the threads of an unfocused window to efficiency
      * cores (hybrid CPUs), and the GPU command thread sets the frame rate. */
     PROCESS_POWER_THROTTLING_STATE throttling = {PROCESS_POWER_THROTTLING_CURRENT_VERSION,
