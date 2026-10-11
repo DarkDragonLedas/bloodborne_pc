@@ -3,6 +3,7 @@
 
 #include <boost/container/small_vector.hpp>
 #include "bbport_toggles.h"
+#include "bblayer_write_traps.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
@@ -11,6 +12,17 @@
 #include "common/signal_context.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "video_core/buffer_cache/buffer.h"
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdio>
+#include <sys/uio.h>
+#include <dlfcn.h>
+#include <string>
+#include <fmt/format.h>
+#include <ucontext.h>
+#include <unistd.h>
 #include "core/signals.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -39,10 +51,197 @@
 #include "common/spin_lock.h"
 #endif
 
+extern "C" void runtime_memory_set_write_watch(uintptr_t address, uint64_t size, int watch);
+extern "C" int runtime_memory_vma_info(uintptr_t address, int* prot, int* type, uintptr_t* end);
+
 namespace VideoCore {
 
 constexpr size_t PM_PAGE_SIZE = 4_KB;
 constexpr size_t PM_PAGE_BITS = 12;
+
+namespace {
+/// bbport: write fault sites (guest code), an open-addressing table keyed by the instruction.
+struct FaultSite {
+    std::atomic<u64> rip{0};
+    std::atomic<u64> caller{0};
+    std::atomic<u64> count{0};
+    std::atomic<u64> last_address{0};
+};
+std::array<FaultSite, 512> fault_sites;
+std::atomic<u64> fault_sites_dropped{0};
+constexpr u64 GuestImage = 0x800000000ull, GuestImageEnd = 0x810000000ull;
+constexpr u64 HostSite = 1ull << 63;
+constexpr u64 ReadSite = 1ull << 62; ///< a read fault (BB_READBACKS=2 protects GPU data from reads)
+
+/// "+offset" for guest code, the symbol for host code.
+std::string SiteName(u64 key) {
+    const char* access = key & ReadSite ? "read:" : "";
+    key &= ~ReadSite;
+    if (!(key & HostSite)) {
+        return fmt::format("{}+{:#x}", access, key);
+    }
+    const u64 address = key & ~HostSite;
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void*>(address), &info) && info.dli_sname) {
+        return fmt::format("{}host:{}+{:#x}", access, info.dli_sname, address - u64(info.dli_saddr));
+    }
+    if (info.dli_fname) {
+        return fmt::format("{}host:{}+{:#x}", access, info.dli_fname, address - u64(info.dli_fbase));
+    }
+    return fmt::format("{}host:{:#x}", access, address);
+}
+
+/// The write fault this thread is handling (guest offsets; 0: none).
+thread_local u64 current_fault_rip = 0, current_fault_caller = 0;
+
+/// Guest code that wrote image (texture) memory: keyed by instruction and image.
+struct ImageFaultSite {
+    std::atomic<u64> key{0}; // a mix of the site and the image address
+    std::atomic<u64> rip{0}, caller{0}, count{0}, image{0}, size{0};
+    std::atomic<u32> width{0}, height{0}, format{0}, tiling{0};
+};
+std::array<ImageFaultSite, 256> image_fault_sites;
+
+void NoteFaultSite(void* context, VAddr address) {
+    const auto* g = static_cast<const ucontext_t*>(context)->uc_mcontext.gregs;
+    current_fault_rip = 0;
+    const u64 rip = u64(g[REG_RIP]);
+    const bool guest_code = rip >= GuestImage && rip < GuestImageEnd;
+    u64 caller = 0;
+    if (guest_code) {
+        // The caller: [rbp + 8] when the guest code keeps frames (its memcpy-like leaves do not).
+        u64 saved[2] = {};
+        iovec local{saved, sizeof(saved)}, remote{reinterpret_cast<void*>(g[REG_RBP]), sizeof(saved)};
+        if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == ssize_t(sizeof(saved)) &&
+            saved[1] >= GuestImage && saved[1] < GuestImageEnd) {
+            caller = saved[1];
+        }
+    } else {
+        // Host code (a libc import the port runs natively, the runtime): the first guest return
+        // address on the stack is its guest caller.
+        std::array<u64, 64> stack{};
+        iovec local{stack.data(), sizeof(stack)},
+            remote{reinterpret_cast<void*>(g[REG_RSP]), sizeof(stack)};
+        const ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+        for (ssize_t i = 0; i < got / 8; ++i) {
+            if (stack[i] >= GuestImage && stack[i] < GuestImageEnd) {
+                caller = stack[i];
+                break;
+            }
+        }
+    }
+    // Guest code: its offset in the image; host code: its address with HostSite set.
+    const u64 key = (guest_code ? rip - GuestImage : rip | HostSite) |
+                    (Common::IsWriteError(context) ? 0 : ReadSite);
+    current_fault_rip = key;
+    current_fault_caller = caller ? caller - GuestImage : 0;
+    for (u64 i = 0, slot = (key * 0x9E3779B97F4A7C15ull) >> 55; i < fault_sites.size(); ++i) {
+        auto& site = fault_sites[(slot + i) % fault_sites.size()];
+        u64 expected = 0;
+        if (site.rip.load(std::memory_order_relaxed) == key ||
+            site.rip.compare_exchange_strong(expected, key)) {
+            site.caller.store(caller ? caller - GuestImage : 0, std::memory_order_relaxed);
+            site.last_address.store(address, std::memory_order_relaxed);
+            site.count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    fault_sites_dropped.fetch_add(1, std::memory_order_relaxed);
+}
+} // namespace
+
+static void ReportImageFaultSites() {
+    bool any = false;
+    for (auto& site : image_fault_sites) {
+        const u64 count = site.count.exchange(0, std::memory_order_relaxed);
+        if (count == 0) {
+            continue;
+        }
+        std::printf("%s %s (from +%#llx) %llu into image %#llx size %llu %ux%u fmt %u tile %u",
+                    any ? ";" : "Image write sites (guest code -> texture, this window):",
+                    SiteName(site.rip.load()).c_str(), (unsigned long long)site.caller.load(),
+                    (unsigned long long)count, (unsigned long long)site.image.load(),
+                    (unsigned long long)site.size.load(), site.width.load(), site.height.load(),
+                    site.format.load(), site.tiling.load());
+        any = true;
+    }
+    if (any) {
+        std::printf("\n");
+    }
+}
+
+void PageManager::NoteImageFault(VAddr image_address, u64 image_size, u32 width, u32 height,
+                                 u32 format, u32 tiling) {
+    if (current_fault_rip == 0) {
+        return;
+    }
+    const u64 key = (current_fault_rip * 0x9E3779B97F4A7C15ull) ^ image_address;
+    for (u64 i = 0, slot = (key * 0x9E3779B97F4A7C15ull) >> 56; i < image_fault_sites.size(); ++i) {
+        auto& site = image_fault_sites[(slot + i) % image_fault_sites.size()];
+        u64 expected = 0;
+        if (site.key.load(std::memory_order_relaxed) == key ||
+            site.key.compare_exchange_strong(expected, key)) {
+            site.rip.store(current_fault_rip, std::memory_order_relaxed);
+            site.caller.store(current_fault_caller, std::memory_order_relaxed);
+            site.image.store(image_address, std::memory_order_relaxed);
+            site.size.store(image_size, std::memory_order_relaxed);
+            site.width.store(width, std::memory_order_relaxed);
+            site.height.store(height, std::memory_order_relaxed);
+            site.format.store(format, std::memory_order_relaxed);
+            site.tiling.store(tiling, std::memory_order_relaxed);
+            site.count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
+
+void PageManager::ReportFaultSites() {
+    struct Row {
+        u64 rip, caller, count, address;
+    };
+    std::array<Row, 512> rows{};
+    std::size_t n = 0;
+    u64 total = 0;
+    for (auto& site : fault_sites) {
+        const u64 count = site.count.exchange(0, std::memory_order_relaxed);
+        if (count != 0) {
+            rows[n++] = {site.rip.load(), site.caller.load(), count, site.last_address.load()};
+            total += count;
+        }
+    }
+    if (total == 0) {
+        return;
+    }
+    ReportImageFaultSites();
+    std::sort(rows.begin(), rows.begin() + n, [](const Row& a, const Row& b) { return a.count > b.count; });
+    std::printf("Write fault sites (guest code, this window): %llu faults", (unsigned long long)total);
+    for (std::size_t i = 0; i < std::min<std::size_t>(n, 12); ++i) {
+        std::printf("%s %s (from +%#llx) %llu at %#llx", i ? ";" : ":",
+                    SiteName(rows[i].rip).c_str(), (unsigned long long)rows[i].caller,
+                    (unsigned long long)rows[i].count, (unsigned long long)rows[i].address);
+    }
+    std::printf("\n");
+}
+
+// bbport: with the game's memory in place (no write tracking), the pages under images are
+// trapped for writes (BbLayer::WriteTraps::Image): a write nobody announced (the game's own copy
+// loops, its heap over an old texture) still reaches the texture cache, on any game and GPU,
+// without hooks in the game's code; the hooks and the libc wrappers only make it sooner.
+// BB_IMAGE_TRAPS=0: announced writes only, as before. Latched at the first use: the counts must
+// match their traps for the whole run.
+static bool ImageTraps() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_IMAGE_TRAPS");
+        const bool enabled = !(env && env[0] == '0') && VideoCore::GuestInPlace() &&
+                             !VideoCore::WriteTracking() && !VideoCore::WriteVerify();
+        if (enabled) {
+            std::printf("Guest memory: writes under images are trapped (BB_IMAGE_TRAPS=0: "
+                        "announced writes only)\n");
+        }
+        return enabled;
+    }();
+    return on;
+}
 
 struct PageManager::Impl {
     struct PageState {
@@ -109,14 +308,36 @@ struct PageManager::Impl {
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
+        NoteFaultSite(context, addr);
         // bbport: the draw recording thread handles its faults inline too (vk_draw_pipe.h).
         const auto is_gpu_thread = rasterizer->IsGpuSideThread();
         if (is_gpu_thread) {
             BbStats::gpu_signal_faults.fetch_add(1, std::memory_order_relaxed);
         }
+        // Traps on reads too (no access, BbLayer::WriteTraps::NoAccess): their owner first.
+        if (BbLayer::WriteTraps::Reasons(addr) & BbLayer::WriteTraps::VramData) {
+            return rasterizer->OnVramDataAccess(addr, is_gpu_thread);
+        }
+        if (BbLayer::WriteTraps::Reasons(addr) & BbLayer::WriteTraps::QueryReads) {
+            return rasterizer->OnOcclusionPageAccess(
+                addr, u64(static_cast<const ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP]),
+                Common::IsWriteError(context), is_gpu_thread);
+        }
         if (Common::IsWriteError(context)) {
+            if (ImageTraps() &&
+                !(BbLayer::WriteTraps::Reasons(addr) & BbLayer::WriteTraps::Image)) {
+                // Not an image's trap: another owner's being lifted by another thread, or one
+                // lifted meanwhile (the write runs again), or a write the game may not do.
+                int prot = 0, type = -1;
+                uintptr_t end = 0;
+                return runtime_memory_vma_info(addr, &prot, &type, &end) && (prot & 0x2);
+            }
             BbStats::Timer timer{BbStats::t_write_faults};
-            return rasterizer->OnWriteFault(addr, is_gpu_thread);
+            const bool handled = rasterizer->OnWriteFault(
+                addr, is_gpu_thread,
+                u64(static_cast<const ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP]));
+            current_fault_rip = 0;
+            return handled;
         } else {
             BbStats::read_faults.fetch_add(1, std::memory_order_relaxed);
             BbStats::Timer timer{BbStats::t_read_faults};
@@ -262,6 +483,54 @@ struct PageManager::Impl {
         release_pending();
     }
 
+    /// bbport ImageTraps: the images over each page; a page is trapped while one is there.
+    template <bool track>
+    void UpdateImageTraps(VAddr addr, u64 size) {
+        std::call_once(image_watchers_once, [this] {
+            void* mem = mmap(nullptr, NUM_ADDRESS_PAGES * sizeof(u16), PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+            ASSERT_MSG(mem != MAP_FAILED, "image watcher table");
+            image_watchers = static_cast<u16*>(mem);
+        });
+        size_t page = addr >> PM_PAGE_BITS;
+        const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
+        const auto lock_start = locks.begin() + (page / PAGES_PER_LOCK);
+        const auto lock_end = locks.begin() + Common::DivCeil(page_end, PAGES_PER_LOCK);
+        Common::RangeLockGuard lk(lock_start, lock_end);
+        // Runs of pages whose first image came or last one went: one trap change each.
+        u64 run_begin = 0, run_pages = 0;
+        const auto flush = [&] {
+            if (run_pages != 0) {
+                BbLayer::WriteTraps::Set(run_begin << PM_PAGE_BITS, run_pages << PM_PAGE_BITS,
+                                         BbLayer::WriteTraps::Image, track);
+                run_pages = 0;
+            }
+        };
+        for (; page != page_end; ++page) {
+            u16& count = image_watchers[page];
+            bool change;
+            if constexpr (track) {
+                change = count++ == 0;
+            } else {
+                ASSERT_MSG(count > 0, "image watchers below zero");
+                change = --count == 0;
+            }
+            if (!change) {
+                continue;
+            }
+            if (run_pages != 0 && run_begin + run_pages == page) {
+                ++run_pages;
+            } else {
+                flush();
+                run_begin = page;
+                run_pages = 1;
+            }
+        }
+        flush();
+    }
+    u16* image_watchers = nullptr;
+    std::once_flag image_watchers_once;
+
     std::array<PageState, NUM_ADDRESS_PAGES> cached_pages{};
 #ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
     using LockType = Common::AdaptiveMutex;
@@ -313,7 +582,7 @@ public:
 
         // Read faults (readbacks) still arrive as signals.
         Core::Signals::Instance()->RegisterAccessViolationHandler(
-            GuestFaultSignalHandler, std::numeric_limits<u32>::min());
+            GuestFaultSignalHandler, 1u);
 
         ufd_thread = std::jthread([this](std::stop_token token) { UffdHandler(token); });
         std::printf("GPU: memory tracking with userfaultfd write-protection\n");
@@ -365,6 +634,14 @@ public:
                 address_space.Protect(address, size, Core::MemoryPermission::ReadWrite);
             }
         }
+        // Counted like AddressSpace::Protect (BB_FRAME_LOG protect_ms).
+        BbStats::Timer timer{BbStats::t_protect};
+        BbStats::protect_calls.fetch_add(1, std::memory_order_relaxed);
+        BbStats::protect_pages.fetch_add(last - first, std::memory_order_relaxed);
+        if (!allow_write) {
+            BbStats::protect_revoke_calls.fetch_add(1, std::memory_order_relaxed);
+            BbStats::protect_revoke_pages.fetch_add(last - first, std::memory_order_relaxed);
+        }
         uffdio_writeprotect wp{};
         wp.range.start = address;
         wp.range.len = size;
@@ -414,14 +691,22 @@ struct SignalImpl : public PageManager::Impl {
     SignalImpl(Vulkan::Rasterizer* rasterizer_) : Impl() {
         rasterizer = rasterizer_;
 
-        // Should be called first.
-        constexpr auto priority = std::numeric_limits<u32>::min();
+        // Should be called first (bbport: after BB_VRAM_ACCESS_TRAP, priority 0, diagnostics only).
+        constexpr u32 priority = 1;
         Core::Signals::Instance()->RegisterAccessViolationHandler(GuestFaultSignalHandler,
                                                                   priority);
     }
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
         RENDERER_TRACE;
+        // bbport BB_GUEST_IN_PLACE: no page protection; the pages are marked in the runtime's write
+        // watch instead, and the writers that check it tell the GPU side (WriteTracking).
+        if (!VideoCore::WriteTracking()) {
+            runtime_memory_set_write_watch(address, size, !True(perms & Core::MemoryPermission::Write));
+            if (!VideoCore::WriteVerify()) {
+                return;
+            }
+        }
         auto* memory = Core::Memory::Instance();
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
@@ -433,7 +718,13 @@ struct SignalImpl : public PageManager::Impl {
 
 PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
 #ifdef __linux__
-    if (std::getenv("BB_UFFD") && std::getenv("BB_UFFD")[0] == '1') {
+    // bbport: dma-buf guest memory (BB_GUEST_GPU_MEMORY=1) cannot be write-protected by userfaultfd
+    // (anonymous and shmem only): its registration would fail and writes go unseen.
+    const char* guest_gpu_memory = std::getenv("BB_GUEST_GPU_MEMORY");
+    const bool dma_buf_guest = guest_gpu_memory && guest_gpu_memory[0] == '1';
+    if (std::getenv("BB_UFFD") && std::getenv("BB_UFFD")[0] == '1' && dma_buf_guest) {
+        std::printf("GPU: userfaultfd off with BB_GUEST_GPU_MEMORY=1 (dma-buf memory)\n");
+    } else if (std::getenv("BB_UFFD") && std::getenv("BB_UFFD")[0] == '1') {
         try {
             impl = std::make_unique<UffdImpl>(rasterizer_);
             LOG_INFO(Config, "Memory tracking method: userfaultfd");
@@ -460,6 +751,10 @@ void PageManager::OnGpuUnmap(VAddr address, size_t size) {
 template <bool track>
 void PageManager::UpdatePageWatchers(VAddr addr, u64 size) const {
     impl->UpdatePageWatchers<track, false>(addr, size);
+    // bbport: only the texture cache comes here (the buffer cache: UpdatePageWatchersForRegion).
+    if (ImageTraps()) {
+        impl->UpdateImageTraps<track>(addr, size);
+    }
 }
 
 template <bool track, bool is_read>

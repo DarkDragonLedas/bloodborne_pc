@@ -1,5 +1,6 @@
 #ifndef BB_RUNTIME_H
 #define BB_RUNTIME_H
+#include <time.h>
 #include <stdint.h>
 #include <stddef.h>
 #ifdef _WIN32
@@ -35,6 +36,17 @@ void runtime_mutex_report(void);
 uintptr_t runtime_memory_resolve(const char *name);
 void runtime_memory_report(void);
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
+/* The CPU is about to write the range outside guest code (a file read): tells the GPU side. */
+void runtime_memory_note_write(uintptr_t address, uint64_t size);
+void runtime_memory_note_cpu_write(uintptr_t address, uint64_t size);
+void runtime_memory_prepare_cpu_write(uintptr_t address, uint64_t size);
+/* bbport (frame stats): a guest thread was blocked `ns` in the runtime (0 cond, 1 mutex, 2 sema, 3 sleep). */
+void runtime_wait_note(int kind, uint64_t ns);
+void runtime_wait_report(double frames);
+void runtime_guest_call_sites(uint64_t out[3]);
+/* bbport: times the game's heap asked for more memory (posix_mmap): a sign it leaks. */
+uint64_t runtime_heap_growths(void);
+static inline uint64_t runtime_wait_clock(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000+(uint64_t)t.tv_nsec; }
 const char *runtime_import_name(const char *name);
 uintptr_t runtime_rwlock_resolve(const char *name);
 void runtime_rwlock_report(void);
@@ -61,6 +73,14 @@ uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *n
 uintptr_t runtime_kernel_resolve(const char *name);
 uintptr_t runtime_file_resolve(const char *name);
 uintptr_t runtime_services_resolve(const char *name);
+/* Online play (runtime_net.c, BB_ONLINE=1): the online module answers the network and PSN imports. */
+void runtime_net_configure(const char *app0, const char *serial, const char *title, const char *version);
+int runtime_net_enabled(void);
+int runtime_net_symbol(const char *symbol);
+uintptr_t runtime_net_resolve(const char *name);
+/* Guest threads for host code (the online module's NP threads); 0 or a positive errno value. */
+int32_t runtime_thread_spawn(void **thread, void *(ABI *entry)(void *), void *argument, uint64_t stack, const char *name);
+int32_t runtime_thread_join_spawned(void *thread, void **result);
 void runtime_file_report(void);
 void runtime_file_configure(const char *app0, const char *user);
 int runtime_file_mount(const char *guest, const char *host);
