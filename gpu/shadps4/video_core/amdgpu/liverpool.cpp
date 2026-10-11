@@ -734,12 +734,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
         switch (type) {
         default:
-            UNREACHABLE_MSG("Wrong PM4 type {}", type);
-            break;
         case 0:
-            UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
-                            header->type0.base.Value(), header->type0.NumWords());
-            break;
+            // A garbage dword read as a packet header (host data, a reused buffer) used to
+            // abort the whole process here. Dropping the rest of this (indirect) buffer
+            // glitches one frame; the surrounding stream keeps its packet framing.
+            LOG_WARNING(Render, "PM4 type {} (base reg {}, {} words) at +{:#x}: buffer dropped",
+                        type, header->type0.base.Value(), header->type0.NumWords(),
+                        reinterpret_cast<uintptr_t>(dcb.data()) - base_addr);
+            co_return;
         case 2:
             // Type-2 packet are used for padding purposes
             dcb = NextPacket(dcb, 1);
@@ -1393,8 +1395,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         if (header->type != 3) {
-            // No other types of packets were spotted so far
-            UNREACHABLE_MSG("Invalid PM4 type {}", header->type.Value());
+            // Garbage header: drop the rest of this buffer instead of aborting the process.
+            LOG_WARNING(Render, "Invalid PM4 type {} in compute: buffer dropped",
+                        header->type.Value());
+            co_return;
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;

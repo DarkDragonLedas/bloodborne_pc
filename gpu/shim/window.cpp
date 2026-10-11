@@ -1,4 +1,5 @@
 // bbport: SDL3 window for the Vulkan swapchain (X11, Wayland or Win32).
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <SDL3/SDL.h>
@@ -7,6 +8,25 @@
 #include "sdl_window.h"
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
+
+extern "C" int bbgpu_overlay_captures_input(void);
+
+namespace {
+/* Mouse-as-camera state: the window thread accumulates relative motion while the mouse is
+ * captured (window focused, overlay closed); runtime_pad.c consumes it as the right stick. */
+std::atomic<int> mouse_dx{0}, mouse_dy{0};
+std::atomic<int> mouse_wheel_pending{0};
+bool mouse_relative{false};
+} // namespace
+
+extern "C" void bbgpu_mouse_delta(float* dx, float* dy) {
+    *dx = static_cast<float>(mouse_dx.exchange(0, std::memory_order_relaxed));
+    *dy = static_cast<float>(mouse_dy.exchange(0, std::memory_order_relaxed));
+}
+
+extern "C" int bbgpu_mouse_wheel() {
+    return mouse_wheel_pending.exchange(0, std::memory_order_relaxed);
+}
 
 namespace Frontend {
 
@@ -130,6 +150,20 @@ bool WindowSDL::PollEvents() {
                 SDL_SetWindowFullscreen(window, !(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN));
             }
             break;
+        case SDL_EVENT_MOUSE_MOTION:
+            if (mouse_relative) {
+                mouse_dx.fetch_add(static_cast<int>(event.motion.xrel), std::memory_order_relaxed);
+                mouse_dy.fetch_add(static_cast<int>(event.motion.yrel), std::memory_order_relaxed);
+            }
+            break;
+        case SDL_EVENT_MOUSE_WHEEL:
+            // Overlay scrolling is handled by BbOverlay::HandleEvent above; not captured
+            // there only when the game plays, so the notches go to the quick-item switch.
+            if (mouse_relative) {
+                mouse_wheel_pending.fetch_add(event.wheel.y > 0.0f ? 1 : event.wheel.y < 0.0f ? -1 : 0,
+                                               std::memory_order_relaxed);
+            }
+            break;
         case SDL_EVENT_QUIT:
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
             is_open = false;
@@ -137,6 +171,14 @@ bool WindowSDL::PollEvents() {
         default:
             break;
         }
+    }
+    // Capture the mouse for camera control while playing; release it for the settings
+    // overlay (Insert menu needs the cursor) and when the window loses focus.
+    const bool capture = !bbgpu_overlay_captures_input() && !text_active &&
+                         (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS);
+    if (capture != mouse_relative) {
+        SDL_SetWindowRelativeMouseMode(window, capture);
+        mouse_relative = capture;
     }
     return is_open;
 }

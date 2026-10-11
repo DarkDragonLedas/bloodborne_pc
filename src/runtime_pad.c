@@ -1,11 +1,13 @@
 /* libScePad on SDL3 gamepads, with a keyboard fallback. SDL events are pumped
  * by the window thread (gpu/shim/window.cpp); here state is only sampled.
  *
- * Keyboard layout (when no gamepad is connected):
- *   WASD left stick, arrow keys right stick, Space Cross, LShift Circle,
- *   E Square, Q Triangle, 1 L1, 3 R1, R L2, F R2, Z L3, C R3,
+ * Keyboard and mouse layout (when no gamepad is connected):
+ *   WASD left stick, mouse right stick (BB_MOUSE_SENS scales it), Space Circle
+ *   (confirm/roll/interact: the Asian game build uses the Japanese convention),
+ *   LShift Cross (cancel/sprint), E R2, Q L1, F Triangle, Z L3, C R3,
+ *   mouse buttons: left R1, right L2, middle R3; wheel switches quick items,
  *   Enter Options, Tab left touchpad, Backspace right touchpad,
- *   IJKL d-pad (I up, K down, J left, L right). */
+ *   d-pad on IJKL and the arrow keys. */
 #define _GNU_SOURCE
 #include "runtime.h"
 #include "gpu/bbgpu.h"
@@ -133,11 +135,12 @@ static void sample_host(PadData *d) {
     }
     if (!k) return;
     static const struct { SDL_Scancode key; uint32_t ps; } keys[]={
-        {SDL_SCANCODE_SPACE,BTN_CROSS}, {SDL_SCANCODE_LSHIFT,BTN_CIRCLE}, {SDL_SCANCODE_E,BTN_SQUARE},
-        {SDL_SCANCODE_Q,BTN_TRIANGLE}, {SDL_SCANCODE_1,BTN_L1}, {SDL_SCANCODE_3,BTN_R1},
-        {SDL_SCANCODE_R,BTN_L2}, {SDL_SCANCODE_F,BTN_R2}, {SDL_SCANCODE_Z,BTN_L3}, {SDL_SCANCODE_C,BTN_R3},
+        {SDL_SCANCODE_SPACE,BTN_CIRCLE}, {SDL_SCANCODE_LSHIFT,BTN_CROSS}, {SDL_SCANCODE_E,BTN_R2},
+        {SDL_SCANCODE_Q,BTN_L1}, {SDL_SCANCODE_F,BTN_TRIANGLE}, {SDL_SCANCODE_Z,BTN_L3}, {SDL_SCANCODE_C,BTN_R3},
+        {SDL_SCANCODE_1,BTN_L1}, {SDL_SCANCODE_3,BTN_R1}, {SDL_SCANCODE_R,BTN_L2},
         {SDL_SCANCODE_RETURN,BTN_OPTIONS},
         {SDL_SCANCODE_I,BTN_UP}, {SDL_SCANCODE_K,BTN_DOWN}, {SDL_SCANCODE_J,BTN_LEFT}, {SDL_SCANCODE_L,BTN_RIGHT},
+        {SDL_SCANCODE_UP,BTN_UP}, {SDL_SCANCODE_DOWN,BTN_DOWN}, {SDL_SCANCODE_LEFT,BTN_LEFT}, {SDL_SCANCODE_RIGHT,BTN_RIGHT},
     };
     for (size_t i=0;i<sizeof(keys)/sizeof(*keys);++i) if (k[keys[i].key]) d->buttons|=keys[i].ps;
     if (k[SDL_SCANCODE_TAB]) touch_click(d,0);
@@ -146,8 +149,29 @@ static void sample_host(PadData *d) {
     if (d->buttons & BTN_R2) d->r2=255;
     d->left_x=(uint8_t)(128-(k[SDL_SCANCODE_A] ? 128 : 0)+(k[SDL_SCANCODE_D] ? 127 : 0));
     d->left_y=(uint8_t)(128-(k[SDL_SCANCODE_W] ? 128 : 0)+(k[SDL_SCANCODE_S] ? 127 : 0));
-    d->right_x=(uint8_t)(128-(k[SDL_SCANCODE_LEFT] ? 128 : 0)+(k[SDL_SCANCODE_RIGHT] ? 127 : 0));
-    d->right_y=(uint8_t)(128-(k[SDL_SCANCODE_UP] ? 128 : 0)+(k[SDL_SCANCODE_DOWN] ? 127 : 0));
+    /* Mouse buttons: left R1 (light attack), right L2 (gun), middle R3 (lock-on);
+     * motion becomes the right stick (camera), decaying back to the center. */
+    const Uint32 mouse=SDL_GetMouseState(NULL,NULL);
+    if (mouse & SDL_BUTTON_LMASK) d->buttons|=BTN_R1;
+    if (mouse & SDL_BUTTON_RMASK) { d->buttons|=BTN_L2; d->l2=255; }
+    if (mouse & SDL_BUTTON_MMASK) d->buttons|=BTN_R3;
+    static float cam_x,cam_y,sens;
+    if (!sens) { const char *env=getenv("BB_MOUSE_SENS"); sens=env && *env ? strtof(env,NULL) : 1.1f; }
+    float mdx=0,mdy=0;
+    bbgpu_mouse_delta(&mdx,&mdy);
+    cam_x=cam_x*0.6f+mdx*sens;
+    cam_y=cam_y*0.6f+mdy*sens;
+    if (cam_x>127) cam_x=127; else if (cam_x<-127) cam_x=-127;
+    if (cam_y>127) cam_y=127; else if (cam_y<-127) cam_y=-127;
+    if (cam_x<2 && cam_x>-2) cam_x=0; /* snap below the dead zone: no drift when idle */
+    if (cam_y<2 && cam_y>-2) cam_y=0;
+    d->right_x=(uint8_t)(128+(int)cam_x);
+    d->right_y=(uint8_t)(128+(int)cam_y);
+    /* Wheel notches become short d-pad presses: up/down switch the quick items. */
+    static int wheel_hold;
+    if (!wheel_hold) wheel_hold=bbgpu_mouse_wheel()*10;
+    if (wheel_hold>0) { d->buttons|=BTN_UP; --wheel_hold; }
+    else if (wheel_hold<0) { d->buttons|=BTN_DOWN; ++wheel_hold; }
 }
 
 /* BB_PAD_FILE=<file>: scripted input for automated runs. The file holds whitespace-separated
