@@ -1,4 +1,7 @@
 // bbport: GPU-side assertion failures stop the port with exit code 23.
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -16,7 +19,11 @@ extern "C" void bbgpu_dump_guest_writes(void* ucontext);
 void assert_fail_impl() {
     if (&runtime_restarting && runtime_restarting) {
         for (;;) {
+#ifdef _WIN32
+            Sleep(INFINITE);
+#else
             pause();
+#endif
         }
     }
     std::fflush(stdout);

@@ -35,11 +35,16 @@
 #include <pthread.h>
 #include <x86intrin.h>
 #include <cstring>
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 #include <string>
 #include <fmt/format.h>
+#ifndef _WIN32
 #include <sys/mman.h>
-#include <ucontext.h>
+#endif
+#include "bbport_ucontext.h"
+#include "bbport_posix_shim.h"
 #include "common/signal_context.h"
 #include "core/signals.h"
 #include <vk_mem_alloc.h>
@@ -2712,7 +2717,7 @@ bool VramTrapHandler(void* context, void* fault_address) {
             return false;
         }
     }
-    const auto* g = static_cast<const ucontext_t*>(context)->uc_mcontext.gregs;
+    const auto* g = UCONTEXT(context)->uc_mcontext.gregs;
     const u64 rip = u64(g[REG_RIP]);
     constexpr u64 Image = 0x800000000ull, ImageEnd = 0x810000000ull;
     u64 caller = 0;

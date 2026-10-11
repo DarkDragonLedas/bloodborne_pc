@@ -15,6 +15,14 @@
 #include <errno.h>
 #ifdef _WIN32
 #include "win32_memory.h"
+/* Anonymous mappings (watched-block bitmaps): plain committed allocations on Windows. */
+#define MAP_PRIVATE 0x02
+#define MAP_ANONYMOUS 0x20
+#define MAP_NORESERVE 0x4000
+#define MAP_FAILED ((void *)-1)
+static void *mmap_anon_shim(void *address, size_t length) { (void)address; return VirtualAlloc(NULL,length,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE); }
+#define mmap(address,length,prot,flags,fd,offset) mmap_anon_shim(address,length)
+#define munmap(mem,length) VirtualFree(mem,0,MEM_RELEASE)
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -109,10 +117,12 @@ static const Region *region_at(uint64_t phys, uint64_t *next) {
 static void add_region(uint64_t phys, uint64_t size) {
     if (region_count==MAX_REGIONS) return;
     int fd=chunk_alloc(phys,size);
+#ifndef _WIN32
     if (fd>=0 && mmap(backing_base+phys,size,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_FIXED,fd,0)==MAP_FAILED) {
         close(fd);
         fd=-1;
     }
+#endif
     size_t i=region_count;
     while (i>0 && regions[i-1].phys>phys) { regions[i]=regions[i-1]; --i; }
     regions[i]=(Region){phys,size,fd>=0 || fd==CHUNK_IMPORTED ? fd : -2};
@@ -194,14 +204,17 @@ static void ensure_chunks(uint64_t phys, uint64_t size) {
     for (uint64_t c=phys/CHUNK;c<=last;++c) {
         if (chunk_fds[c]!=-1) continue;
         int fd=chunk_alloc ? chunk_alloc(c*CHUNK,chunk_size(c)) : -1;
+#ifndef _WIN32
         if (fd>=0 && mmap(backing_base+c*CHUNK,chunk_size(c),PROT_READ|PROT_WRITE,MAP_SHARED|MAP_FIXED,fd,0)==MAP_FAILED) {
             close(fd);
             fd=-1;
         }
+#endif
         chunk_fds[c]=fd>=0 || fd==CHUNK_IMPORTED ? fd : -2;
     }
 }
 /* mmap of direct or flexible memory at phys, split where it crosses chunks. */
+#ifndef _WIN32
 static void *map_phys(uintptr_t address, uint64_t size, int prot, uint64_t phys) {
     if (!chunk_fds || phys>=POOL_SIZE)
         return mmap((void *)address,size,prot,MAP_SHARED|MAP_FIXED,pool_fd,(off_t)phys);
@@ -241,8 +254,13 @@ static void *map_phys(uintptr_t address, uint64_t size, int prot, uint64_t phys)
     }
     return (void *)address;
 }
+#endif
 /* Returns released physical memory to zero: hole punching in the memfd, a clear in a chunk. */
 static void zero_phys(uint64_t phys, uint64_t size) {
+#ifdef _WIN32
+    memset(backing_base+phys,0,size); /* no hole punching: zero through the view */
+}
+#else
     for (uint64_t done=0;done<size;) {
         const uint64_t at=phys+done;
         if (!chunk_fds || at>=POOL_SIZE) {
@@ -264,6 +282,7 @@ static void zero_phys(uint64_t phys, uint64_t size) {
         done+=n;
     }
 }
+#endif
 static void queue_hook(int kind, uintptr_t address, uint64_t size) {
     GpuRange hook = kind==HOOK_MAP ? hook_map : kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
     if (!hook) return;
@@ -869,7 +888,15 @@ void runtime_memory_note_cpu_write(uintptr_t address, uint64_t size) {
 #define TRAP_LIMIT (1ull<<40)
 #define TRAP_NO_ACCESS 0xf0u
 static uint8_t *trap_reasons; /* one byte per 4 KiB page below TRAP_LIMIT (reserved, not committed) */
+#ifdef _WIN32
+static SRWLOCK trap_mutex=SRWLOCK_INIT;
+#define trap_lock(m) AcquireSRWLockExclusive(m)
+#define trap_unlock(m) ReleaseSRWLockExclusive(m)
+#else
 static pthread_mutex_t trap_mutex=PTHREAD_MUTEX_INITIALIZER;
+#define trap_lock(m) pthread_mutex_lock(m)
+#define trap_unlock(m) pthread_mutex_unlock(m)
+#endif
 /* A page's trap level: 0 none, 1 read-only, 2 no access. */
 static int trap_level(uint8_t reasons) { return !reasons ? 0 : (reasons & TRAP_NO_ACCESS) ? 2 : 1; }
 /* The pages [a, b) to the game's protection, without write at level 1, without access at 2
@@ -879,23 +906,27 @@ static void trap_apply(uintptr_t a, uintptr_t b, int level) {
         if (vmas[i].kind==KIND_RESERVED) continue;
         const uintptr_t s=vmas[i].start>a ? vmas[i].start : a, e=vmas[i].end<b ? vmas[i].end : b;
         const int prot=host_prot(vmas[i].prot);
+#ifdef _WIN32
+        win_mem_protect(s,e,host_prot(level==2 ? 0 : level ? (prot & ~PROT_WRITE) : prot));
+#else
         mprotect((void *)s,e-s,level==2 ? PROT_NONE : level ? (prot & ~PROT_WRITE) : prot);
+#endif
     }
 }
 /* No traps in [start, end) any more: a mapping replaced or gone (runtime lock held). */
 static void trap_forget(uintptr_t start, uintptr_t end) {
     if (!trap_reasons || start>=TRAP_LIMIT) return;
     if (end>TRAP_LIMIT) end=TRAP_LIMIT;
-    pthread_mutex_lock(&trap_mutex);
+    trap_lock(&trap_mutex);
     memset(trap_reasons+(start>>12),0,((end+4095)>>12)-(start>>12));
-    pthread_mutex_unlock(&trap_mutex);
+    trap_unlock(&trap_mutex);
 }
 /* Pages with traps in [start, end) read-only (or no access) again after the game changed their
  * protection (runtime lock held). */
 static void trap_reapply(uintptr_t start, uintptr_t end) {
     if (!trap_reasons || start>=TRAP_LIMIT) return;
     if (end>TRAP_LIMIT) end=TRAP_LIMIT;
-    pthread_mutex_lock(&trap_mutex);
+    trap_lock(&trap_mutex);
     uintptr_t run=0; int run_level=0;
     for (uintptr_t p=start>>12; p<(end+4095)>>12; ++p) {
         const int level=trap_level(trap_reasons[p]);
@@ -903,7 +934,7 @@ static void trap_reapply(uintptr_t start, uintptr_t end) {
         if (level && !run) { run=p<<12; run_level=level; }
     }
     if (run) trap_apply(run,end,run_level);
-    pthread_mutex_unlock(&trap_mutex);
+    trap_unlock(&trap_mutex);
 }
 void runtime_memory_trap(uintptr_t address, uint64_t size, unsigned reason, int on) {
     if (!size || address>=TRAP_LIMIT) return;
@@ -916,7 +947,7 @@ void runtime_memory_trap(uintptr_t address, uint64_t size, unsigned reason, int 
     }
     uintptr_t end=address+size>TRAP_LIMIT ? TRAP_LIMIT : address+size;
     read_lock();
-    pthread_mutex_lock(&trap_mutex);
+    trap_lock(&trap_mutex);
     /* Runs of pages whose trap level changes, one mprotect each. */
     uintptr_t run=0; int run_level=0;
     const uintptr_t first=address>>12, last=(end-1)>>12;
@@ -928,7 +959,7 @@ void runtime_memory_trap(uintptr_t address, uint64_t size, unsigned reason, int 
         if (change && !run) { run=p<<12; run_level=level; }
     }
     if (run) trap_apply(run,(last+1)<<12,run_level);
-    pthread_mutex_unlock(&trap_mutex);
+    trap_unlock(&trap_mutex);
     read_unlock();
 }
 /* bbport: a libc write about to land on pages with write traps: the GPU side is told first and

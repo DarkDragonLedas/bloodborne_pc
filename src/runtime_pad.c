@@ -34,6 +34,16 @@
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
+#ifdef _WIN32
+#include <strings.h>
+/* strcasestr is POSIX; a small case-insensitive version (Windows). */
+static const char *strcasestr_local(const char *haystack, const char *needle) {
+    const size_t n=strlen(needle);
+    for (; *haystack; ++haystack) if (!strncasecmp(haystack,needle,n)) return haystack;
+    return NULL;
+}
+#define strcasestr strcasestr_local
+#endif
 #include <SDL3/SDL.h>
 #include <sys/stat.h>
 
@@ -569,8 +579,16 @@ static void read_inject(void) {
     last_check=now;
     struct stat st;
     if (stat(path,&st)!=0) return;
+#ifdef _WIN32
+    if (st.st_mtime==mtime.tv_sec) return;
+#else
     if (st.st_mtim.tv_sec==mtime.tv_sec && st.st_mtim.tv_nsec==mtime.tv_nsec) return;
+#endif
+#ifdef _WIN32
+    mtime=(struct timespec){st.st_mtime,0};
+#else
     mtime=st.st_mtim;
+#endif
     FILE *f=fopen(path,"r");
     if (!f) return;
     static const struct { const char *name; uint32_t ps; } names[]={

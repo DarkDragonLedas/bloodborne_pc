@@ -71,7 +71,10 @@ static void remove_stale_temps(const char *dir,int depth) {
             int open_now=0;
             for (int i=3;i<MAX_FILES;++i) if (files[i].used && files[i].temp && !strcmp(files[i].temp,path)) open_now=1;
             if (!open_now && !unlink(path)) printf("Runtime: removed %s (a save interrupted earlier; the file it would have replaced is intact)\n",path);
-        } else if (depth<4 && e->d_type==DT_DIR) remove_stale_temps(path,depth+1);
+        } else if (depth<4) {
+            HostStat st;
+            if (!host_stat(path,&st) && S_ISDIR(st.st_mode)) remove_stale_temps(path,depth+1);
+        }
     }
     closedir(d);
 }
@@ -239,7 +242,11 @@ static void convert_stat(const HostStat *s,GuestStat *g) {
     g->mode=(uint16_t)s->st_mode;
     g->blocks=s->st_blocks; g->blksize=(uint32_t)s->st_blksize;
     g->atime=(GuestTimespec){s->st_atim.tv_sec,s->st_atim.tv_nsec};
+#ifdef _WIN32
+    g->mtime=(GuestTimespec){s->st_mtime,0};
+#else
     g->mtime=(GuestTimespec){s->st_mtim.tv_sec,s->st_mtim.tv_nsec};
+#endif
     g->ctime=(GuestTimespec){s->st_ctim.tv_sec,s->st_ctim.tv_nsec};
 #endif
     g->birthtime=g->ctime;
@@ -278,10 +285,10 @@ static int copy_contents(int from,int to) {
 /* A save file open for writing is its copy to the operations by path too (the game stats the
  * file it is writing, which may not exist yet: it renames the old one to its backup first). */
 static void current_copy(char *path,size_t size,int write) {
-    pthread_mutex_lock(&lock);
+    host_lock(&lock);
     for (int i=3;i<MAX_FILES;++i)
         if (files[i].used && files[i].commit && !strcmp(files[i].commit,path)) { snprintf(path,size,"%s",files[i].temp); files[i].dirty|=write; break; }
-    pthread_mutex_unlock(&lock);
+    host_unlock(&lock);
 }
 /* Returns the descriptor of the copy, or -(errno). */
 static int open_for_commit(const char *path,const char *source,int flags,int mode,char **commit,char **temp) {
@@ -364,15 +371,13 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     }
     }
     if (save_trace() && save_path(guest))
-        printf("Save trace: open(%s, flags 0x%x) -> host %d%s%s
-",guest,flags,host,temp ? ", copy " : "",temp ? temp : "");
+        printf("Save trace: open(%s, flags 0x%x) -> host %d%s%s\n",guest,flags,host,temp ? ", copy " : "",temp ? temp : "");
     if (host<0) {
         e=errno;
         if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
         return -e;
     }
     if (!host_fstat(host,&s) && S_ISDIR(s.st_mode)) dir=list_directory(path);
-    }
     host_lock(&lock);
     int fd=-1;
     for (int i=3;i<MAX_FILES;++i) if (!files[i].used) { fd=i; break; }
@@ -408,8 +413,7 @@ static int64_t do_close(int fd) {
     if (closed.temp) result=commit_file(&closed);
     else if (closed.host>=0) close(closed.host);
     if (save_trace() && save_path(closed.path))
-        printf("Save trace: close(fd %d, %s)%s -> %d
-",fd,closed.path,closed.temp ? closed.dirty ? " commit" : " unwritten" : "",result);
+        printf("Save trace: close(fd %d, %s)%s -> %d\n",fd,closed.path,closed.temp ? closed.dirty ? " commit" : " unwritten" : "",result);
     free(closed.commit); free(closed.temp);
     return result;
 }
@@ -529,8 +533,7 @@ static int64_t do_stat(const char *guest,GuestStat *out) {
     if (!out) return -EFAULT;
     int r=host_stat(path,&s) ? -errno : 0;
     if (r==-ENOENT && !save_path(guest) && fix_case(path)) r=host_stat(path,&s) ? -errno : 0;
-    if (save_trace() && save_path(guest)) printf("Save trace: stat(%s) -> %d, %lld bytes
-",guest,r,r ? -1LL : (long long)s.st_size);
+    if (save_trace() && save_path(guest)) printf("Save trace: stat(%s) -> %d, %lld bytes\n",guest,r,r ? -1LL : (long long)s.st_size);
     if (r) return r;
     convert_stat(&s,out); return 0;
 }

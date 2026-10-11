@@ -1,4 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#ifdef _WIN32
+// Windows keeps this Linux-mmap-based feature off for now; the interface stays.
+#include "bbport_guest_hooks.h"
+
+namespace BbGuestHooks {
+void Install(RangeCallback) {}
+} // namespace BbGuestHooks
+#else
 #include "bbport_guest_hooks.h"
 #include "bbport_heap_sites.h"
 #include "bbport_toggles.h"
@@ -418,3 +426,5 @@ void Install(RangeCallback on_gpu_range_allocated) {
     }
 }
 } // namespace BbGuestHooks
+
+#endif

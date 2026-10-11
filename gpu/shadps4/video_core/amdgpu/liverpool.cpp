@@ -18,6 +18,26 @@
 #include "bbport_timeline.h"
 #include "bbport_copy.h"
 #include "bbport_platform.h"
+
+#ifdef _WIN32
+#include <cstring>
+// process_vm_readv reads another (here: this) process's memory without faulting; Windows has
+// no equivalent, and these diagnostics only need "mapped or not": a VMA check plus a copy.
+extern "C" int runtime_memory_vma_info(uintptr_t address, int* prot, int* type, uintptr_t* end);
+struct iovec { void* iov_base; size_t iov_len; };
+inline long long process_vm_readv(int, const iovec* local, unsigned long,
+                                  const iovec* remote, unsigned long, unsigned long) {
+    int prot = 0, type = -1;
+    uintptr_t end = 0;
+    const uintptr_t from = reinterpret_cast<uintptr_t>(remote->iov_base);
+    if (!runtime_memory_vma_info(from, &prot, &type, &end) ||
+        end < from + static_cast<uintptr_t>(remote->iov_len))
+        return -1;
+    std::memcpy(local->iov_base, remote->iov_base, remote->iov_len);
+    return static_cast<long long>(remote->iov_len);
+}
+#endif
+
 #include "bbport_toggles.h"
 #include <cstdio>
 #include <boost/preprocessor/stringize.hpp>

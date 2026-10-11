@@ -1,4 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#ifdef _WIN32
+// Windows keeps this Linux-mmap-based feature off for now; the interface stays.
+#include "bbport_game_menu.h"
+
+namespace BbGameMenu {
+void PatchImage(unsigned char*, std::uint64_t) {}
+void Poll() {}
+} // namespace BbGameMenu
+#else
 #include "bbport_game_menu.h"
 
 #include <sys/mman.h>
@@ -636,3 +645,5 @@ void Poll() {
 }
 
 } // namespace BbGameMenu
+
+#endif

@@ -1,4 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#ifdef _WIN32
+// Windows keeps this Linux-mmap-based feature off for now; the interface stays.
+#include "bbport_gnm_hooks.h"
+
+namespace BbGnmHooks {
+void PatchImage(unsigned char*, std::uint64_t) {}
+void CheckSubmission(const std::uint32_t*, std::uint64_t) {}
+DriverWrite::~DriverWrite() {}
+} // namespace BbGnmHooks
+#else
 #include "bbport_gnm_hooks.h"
 
 #include <algorithm>
@@ -614,3 +624,5 @@ DriverWrite::~DriverWrite() {
     Mark(std::uint32_t(Count), begin, end);
 }
 } // namespace BbGnmHooks
+
+#endif

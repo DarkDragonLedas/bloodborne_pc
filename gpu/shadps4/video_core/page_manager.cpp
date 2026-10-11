@@ -17,14 +17,71 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#ifndef _WIN32
 #include <sys/uio.h>
+#endif
+#ifdef _WIN32
+// dladdr/mmap diagnostics shims: module name and offset instead of a symbol, VirtualAlloc
+// instead of an anonymous mapping (the table is small and never freed).
+#include <windows.h>
+#include <psapi.h>
+struct Dl_info { const char* dli_fname; void* dli_fbase; const char* dli_sname; void* dli_saddr; };
+inline int dladdr(const void* addr, Dl_info* info) {
+    HMODULE m = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            static_cast<LPCWSTR>(addr), &m))
+        return 0;
+    static thread_local wchar_t wpath[MAX_PATH];
+    static thread_local char path[MAX_PATH];
+    GetModuleFileNameW(m, wpath, MAX_PATH);
+    WideCharToMultiByte(CP_UTF8, 0, wpath, -1, path, MAX_PATH, nullptr, nullptr);
+    info->dli_fname = path;
+    info->dli_fbase = m;
+    info->dli_sname = nullptr;
+    info->dli_saddr = nullptr;
+    return 1;
+}
+#define PROT_READ 0x1
+#define PROT_WRITE 0x2
+#define MAP_PRIVATE 0x02
+#define MAP_ANONYMOUS 0x20
+#define MAP_NORESERVE 0x4000
+#define MAP_FAILED reinterpret_cast<void*>(-1)
+inline void* mmap(void*, size_t length, int, int, int, long long) {
+    return VirtualAlloc(nullptr, length, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+}
+inline int munmap(void* mem, size_t) { VirtualFree(mem, 0, MEM_RELEASE); return 0; }
+#endif
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 #include <string>
 #include <fmt/format.h>
-#include <ucontext.h>
+#include "bbport_ucontext.h"
 #include <unistd.h>
 #include "core/signals.h"
 #include "video_core/page_manager.h"
+
+#ifdef _WIN32
+#include <cstring>
+// process_vm_readv reads another (here: this) process's memory without faulting; Windows has
+// no equivalent, and these diagnostics only need "mapped or not": a VMA check plus a copy.
+extern "C" int runtime_memory_vma_info(uintptr_t address, int* prot, int* type, uintptr_t* end);
+struct iovec { void* iov_base; size_t iov_len; };
+inline long long process_vm_readv(int, const iovec* local, unsigned long,
+                                  const iovec* remote, unsigned long, unsigned long) {
+    int prot = 0, type = -1;
+    uintptr_t end = 0;
+    const uintptr_t from = reinterpret_cast<uintptr_t>(remote->iov_base);
+    if (!runtime_memory_vma_info(from, &prot, &type, &end) ||
+        end < from + static_cast<uintptr_t>(remote->iov_len))
+        return -1;
+    std::memcpy(local->iov_base, remote->iov_base, remote->iov_len);
+    return static_cast<long long>(remote->iov_len);
+}
+#endif
+
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 #ifndef _WIN64
@@ -103,7 +160,7 @@ struct ImageFaultSite {
 std::array<ImageFaultSite, 256> image_fault_sites;
 
 void NoteFaultSite(void* context, VAddr address) {
-    const auto* g = static_cast<const ucontext_t*>(context)->uc_mcontext.gregs;
+    const auto* g = UCONTEXT(context)->uc_mcontext.gregs;
     current_fault_rip = 0;
     const u64 rip = u64(g[REG_RIP]);
     const bool guest_code = rip >= GuestImage && rip < GuestImageEnd;
@@ -320,7 +377,7 @@ struct PageManager::Impl {
         }
         if (BbLayer::WriteTraps::Reasons(addr) & BbLayer::WriteTraps::QueryReads) {
             return rasterizer->OnOcclusionPageAccess(
-                addr, u64(static_cast<const ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP]),
+                addr, u64(UCONTEXT(context)->uc_mcontext.gregs[REG_RIP]),
                 Common::IsWriteError(context), is_gpu_thread);
         }
         if (Common::IsWriteError(context)) {
@@ -335,7 +392,7 @@ struct PageManager::Impl {
             BbStats::Timer timer{BbStats::t_write_faults};
             const bool handled = rasterizer->OnWriteFault(
                 addr, is_gpu_thread,
-                u64(static_cast<const ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP]));
+                u64(UCONTEXT(context)->uc_mcontext.gregs[REG_RIP]));
             current_fault_rip = 0;
             return handled;
         } else {

@@ -12,6 +12,10 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <x86intrin.h>
+#include <pthread.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #ifndef _WIN32
 #include <sys/random.h>
 #include <sys/resource.h>
@@ -335,11 +339,6 @@ static const RuntimeExport exports[]={
     {"pthread_setspecific",posix_key_set}, {"pthread_getspecific",key_get},
 };
 uintptr_t runtime_kernel_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
-#else
-uintptr_t runtime_kernel_resolve(const char *name) { (void)name; return 0; }
-int32_t runtime_guest_errno(int e) { return e ? 5 : 0; }
-void runtime_thread_keys_cleanup(void) {}
-#endif
 
 static void sample_start(void);
 static void sample_report(void);
@@ -356,9 +355,15 @@ static void guest_call_sites(uint64_t out[3]) {
     const uintptr_t text_lo=0x800000000ull, text_hi=0x800000000ull+0x50d96dcull;
     static _Thread_local uintptr_t stack_hi;
     if (!stack_hi) {
+#ifdef _WIN32
+        ULONG_PTR stack_lo=0, stack_hi_w=0;
+        GetCurrentThreadStackLimits(&stack_lo,&stack_hi_w);
+        stack_hi=(uintptr_t)stack_hi_w;
+#else
         pthread_attr_t attr; void *base=NULL; size_t size=0;
         if (!pthread_getattr_np(pthread_self(),&attr)) { pthread_attr_getstack(&attr,&base,&size); pthread_attr_destroy(&attr); }
         stack_hi=(uintptr_t)base+size;
+#endif
     }
     const uintptr_t *sp=(const uintptr_t *)__builtin_frame_address(0);
     int found=0;
@@ -369,7 +374,11 @@ void runtime_wait_note(int kind, uint64_t ns) {
     static int enabled=-1;
     if (enabled<0) enabled=getenv("BB_FRAME_STATS")!=NULL;
     if (!enabled) return;
+#ifdef _WIN32
+    if (!wait_tid) wait_tid=(int)GetCurrentThreadId();
+#else
     if (!wait_tid) wait_tid=(int)syscall(SYS_gettid);
+#endif
     uint64_t sites[3];
     guest_call_sites(sites);
     const uint64_t key=((sites[0]<<20)^(sites[1]*0x9E3779B1ull)^(sites[2]<<7)^((uint64_t)wait_tid<<4)^(uint64_t)kind)|1;
@@ -411,109 +420,8 @@ void runtime_wait_report(double frames) {
     printf("\n");
 }
 
-/* bbport BB_SAMPLE_THREAD=<name> (with frame stats): where that thread runs, sampled with SIGPROF
- * every 0.5 ms; reported with the wait profile. A thread that never blocks but waits for the GPU
- * shows up spinning in its polling loop. */
-static _Atomic uint64_t sample_keys[1024], sample_counts[1024];
-static uint64_t sample_rips[1024], sample_callers[1024];
-static _Atomic uint64_t samples_total;
-static void sample_handler(int sig, siginfo_t *info, void *context) {
-    (void)sig; (void)info;
-    const ucontext_t *uc=(const ucontext_t *)context;
-    uint64_t rip=(uint64_t)uc->uc_mcontext.gregs[REG_RIP];
-    const uint64_t text_lo=0x800000000ull, text_hi=0x800000000ull+0x50d96dcull;
-    /* Host code: keyed with its guest caller, the first return address into the game on the stack. */
-    uint64_t caller=0;
-    if (rip<text_lo || rip>=text_hi) {
-        uint64_t stack[256]={0};
-        struct iovec local={stack,sizeof(stack)}, remote={(void *)uc->uc_mcontext.gregs[REG_RSP],sizeof(stack)};
-        const ssize_t got=process_vm_readv(getpid(),&local,1,&remote,1,0);
-        for (ssize_t i=0;i<got/8;++i) if (stack[i]>=text_lo && stack[i]<text_hi) { caller=stack[i]-text_lo; break; }
-    }
-    const uint64_t key=(rip*0x9E3779B97F4A7C15ull)^caller^1;
-    atomic_fetch_add(&samples_total,1);
-    for (uint64_t i=0,slot=(key*0x9E3779B97F4A7C15ull)>>54;i<1024;++i) {
-        _Atomic uint64_t *k=&sample_keys[(slot+i)%1024];
-        uint64_t expected=0;
-        if (atomic_load(k)==key || atomic_compare_exchange_strong(k,&expected,key)) {
-            sample_rips[(slot+i)%1024]=rip; sample_callers[(slot+i)%1024]=caller;
-            atomic_fetch_add(&sample_counts[(slot+i)%1024],1);
-            return;
-        }
-    }
-}
-static void *sampler_main(void *arg) {
-    const char *name=(const char *)arg;
-    pid_t tid=0;
-    while (!tid) {
-        DIR *dir=opendir("/proc/self/task");
-        struct dirent *e;
-        while (dir && (e=readdir(dir))) {
-            char path[300], comm[32]={0};
-            snprintf(path,sizeof(path),"/proc/self/task/%s/comm",e->d_name);
-            FILE *f=fopen(path,"r");
-            if (!f) continue;
-            if (fgets(comm,sizeof(comm),f) && !strncmp(comm,name,strlen(name))) tid=(pid_t)atoi(e->d_name);
-            fclose(f);
-        }
-        if (dir) closedir(dir);
-        if (!tid) sleep(1);
-    }
-    printf("Runtime: sampling thread %s (%d)\n",name,(int)tid);
-    for (;;) {
-        if (syscall(SYS_tgkill,getpid(),tid,SIGPROF)) break;
-        struct timespec t={0,500000};
-        nanosleep(&t,NULL);
-    }
-    return NULL;
-}
-static void sample_start(void) {
-    static int started;
-    const char *name=getenv("BB_SAMPLE_THREAD");
-    if (started || !name || !*name) return;
-    started=1;
-    struct sigaction action={0};
-    action.sa_sigaction=sample_handler;
-    action.sa_flags=SA_SIGINFO|SA_RESTART;
-    sigemptyset(&action.sa_mask);
-    sigaction(SIGPROF,&action,NULL);
-    pthread_t thread;
-    pthread_create(&thread,NULL,sampler_main,(void *)name);
-    pthread_detach(thread);
-}
-static void sample_report(void) {
-    static int got_dumped;
-    if (!got_dumped) {
-        got_dumped=1;
-        const char *got=getenv("BB_DUMP_GOT"); /* a guest GOT slot (offset): which host function it calls */
-        if (got && *got) {
-            const uint64_t target=*(const uint64_t *)(0x800000000ull+strtoull(got,NULL,0));
-            Dl_info dl={0};
-            dladdr((void *)target,&dl);
-            printf("Runtime: GOT %s -> %#lx %s:%s+%#lx\n",got,(unsigned long)target,dl.dli_fname ? dl.dli_fname : "?",
-                   dl.dli_sname ? dl.dli_sname : "?",(unsigned long)(target-(uint64_t)(dl.dli_sname ? dl.dli_saddr : dl.dli_fbase)));
-        }
-    }
-    const uint64_t total=atomic_exchange(&samples_total,0);
-    if (!total) return;
-    struct { uint64_t rip, caller, count; } rows[1024]; int n=0;
-    for (int i=0;i<1024;++i) { uint64_t c=atomic_exchange(&sample_counts[i],0); if (c) { rows[n].rip=sample_rips[i]; rows[n].caller=sample_callers[i]; rows[n].count=c; ++n; } }
-    for (int i=1;i<n;++i) for (int j=i;j>0 && rows[j].count>rows[j-1].count;--j) { __typeof__(rows[0]) t=rows[j]; rows[j]=rows[j-1]; rows[j-1]=t; }
-    printf("Thread samples (%llu):",(unsigned long long)total);
-    for (int i=0;i<n && i<16;++i) {
-        const uint64_t text_lo=0x800000000ull, text_hi=0x800000000ull+0x50d96dcull;
-        if (rows[i].rip>=text_lo && rows[i].rip<text_hi) {
-            printf("%s +%#lx %.1f%%",i?";":"",(unsigned long)(rows[i].rip-text_lo),100.0*rows[i].count/total);
-            continue;
-        }
-        Dl_info dl={0};
-        dladdr((void *)rows[i].rip,&dl);
-        const char *module=dl.dli_fname ? strrchr(dl.dli_fname,'/') : NULL;
-        printf("%s host:%s%s%s+%#lx (from +%#lx) %.1f%%",i?";":"",module ? module+1 : "?",dl.dli_sname ? ":" : "",
-               dl.dli_sname ? dl.dli_sname : "",(unsigned long)(rows[i].rip-(dl.dli_sname ? (uint64_t)dl.dli_saddr : (uint64_t)dl.dli_fbase)),
-               (unsigned long)rows[i].caller,100.0*rows[i].count/total);
-    }
-    printf("\n");
-}
+/* Windows: no SIGPROF sampling; the wait profile itself (runtime_wait_note) still runs. */
+static void sample_start(void) {}
+static void sample_report(void) {}
 /* The first three return addresses into the game's code on the calling thread's stack. */
 void runtime_guest_call_sites(uint64_t out[3]) { guest_call_sites(out); }

@@ -88,9 +88,15 @@ Module LoadModule(const std::filesystem::path& path) {
 void* FindSymbol(Module module, const char* name) {
     return dlsym(module, name);
 }
+#endif
+
+void BridgeLog(int warning, const char* message) {
+    std::printf("DLSS: %s%s\n", warning ? "warning: " : "", message);
+}
+
+
 /// The player's DLSS folder (<user>/dlss, BB_GPU_USER_DIR; beside bb-probe without it): NGX's
-/// logs, and NVIDIA's library when the player chose one in the launcher (newer than the package's,
-/// or the only one: the package may come without it).
+/// logs, and NVIDIA's library when the player chose one in the launcher.
 std::filesystem::path UserDlssDirectory() {
     if (const char* user = std::getenv("BB_GPU_USER_DIR"); user && user[0]) {
         std::error_code error;
@@ -120,11 +126,6 @@ std::filesystem::path BridgeDirectory() {
         }
     }
     return {};
-}
-#endif
-
-void BridgeLog(int warning, const char* message) {
-    std::printf("DLSS: %s%s\n", warning ? "warning: " : "", message);
 }
 
 bool CollectExtensions(const VkExtensionProperties* required, u32 count,

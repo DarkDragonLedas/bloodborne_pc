@@ -14,8 +14,10 @@
 #include <atomic>
 #include <mutex>
 #include <unordered_set>
+#ifndef _WIN32
 #include <sys/mman.h>
-#include <ucontext.h>
+#endif
+#include "bbport_ucontext.h"
 #include <map>
 #include <tuple>
 #include <string>
@@ -1236,15 +1238,15 @@ bool BufferCache::LayerGpuWriteToVram(VAddr address, u64 size) {
     if (log && !vram && size >= (u64{1} << 20)) {
         static std::map<std::pair<VAddr, u64>, u32> seen;
         if (seen.size() < 64 && seen[{address, size}]++ == 0) {
-            std::string near;
+            std::string near_text;
             texture_cache.ForEachImageInRegion(address, size, [&](ImageId, Image& image) {
-                near += fmt::format(" [{:#x}+{:#x} {}x{} fmt {}]", image.info.guest_address,
+                near_text += fmt::format(" [{:#x}+{:#x} {}x{} fmt {}]", image.info.guest_address,
                                     image.info.guest_size, image.info.size.width,
                                     image.info.size.height, u32(image.info.pixel_format));
             });
             std::printf("Layer write in place: %#llx+%#llx; images:%s\n",
                         (unsigned long long)address, (unsigned long long)size,
-                        near.empty() ? " none" : near.c_str());
+                        near_text.empty() ? " none" : near_text.c_str());
         }
     }
     return vram;
@@ -1421,7 +1423,7 @@ bool LayerTrapHandler(void* context, void* fault_address) {
         if (!layer_trap_armed.erase(block)) {
             return false;
         }
-        const auto* g = static_cast<const ucontext_t*>(context)->uc_mcontext.gregs;
+        const auto* g = UCONTEXT(context)->uc_mcontext.gregs;
         layer_trap_hits.emplace_back(block, u64(g[REG_RIP]));
     }
     LayerUnprotect(block); // the write runs again, now through

@@ -31,7 +31,7 @@ case $(uname -s) in MINGW*|MSYS*|CYGWIN*) windows=1 ;; esac
 cstd=(-std=c11)
 threads=(-pthread)
 if [[ -n $windows ]]; then
-    threads=()
+    # 0.5's runtime uses pthreads calls (mutex, nanosleep, thread names); winpthreads provides them
     libraries=("${libraries[@]/-mwindows/-mconsole}")
     cstd=(-std=gnu11 -D_FILE_OFFSET_BITS=64 -D_WIN32_WINNT=0x0A00)
 fi

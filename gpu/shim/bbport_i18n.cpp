@@ -231,7 +231,7 @@ constexpr Pair kRussian[] = {
 } // namespace
 
 const char* Tr(const char* english) {
-    if (BbSettings::Get().menu_language != BbSettings::MenuRussian || !english) {
+    if (BbSettings::Get().menu_language != BbSettings::MenuLanguage::Russian || !english) {
         return english;
     }
     static const auto table = [] {

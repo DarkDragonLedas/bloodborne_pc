@@ -9,10 +9,15 @@
 #include <unordered_map>
 #include <cstring>
 #include <string>
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
+#ifndef _WIN32
 #include <execinfo.h>
+#endif
 #include <unistd.h>
 #include <functional>
+#include "bbport_posix_shim.h"
 
 #include "bbport_copy.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"

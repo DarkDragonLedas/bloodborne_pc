@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_write_log.h"
+#include "bbport_ucontext.h"
 #include "bbport_free_check.h"
 
 #include <array>
@@ -110,7 +111,7 @@ void DumpRange(std::uint64_t address, std::uint64_t size) {
 // Linux: a ucontext_t from the SIGSEGV handler; Windows: the vectored handler's EXCEPTION_POINTERS.
 extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
     using namespace BbWriteLog;
-    const auto* uc = static_cast<const ucontext_t*>(ucontext);
+    const auto* uc = UCONTEXT(ucontext);
     const auto* g = uc->uc_mcontext.gregs;
     BbFreeCheck::DumpAtFault(std::uint64_t(g[REG_RAX]), std::uint64_t(g[REG_R14]));
     if (Mode() == 0) {
@@ -150,18 +151,6 @@ extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
         std::fprintf(stderr, "Write log: %llu writes logged\n", (unsigned long long)n);
         return;
     }
-#ifdef _WIN32
-    const CONTEXT* c = static_cast<const EXCEPTION_POINTERS*>(ucontext)->ContextRecord;
-    const std::uint64_t regs[] = {c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->R14, c->R15};
-#else
-    const auto* uc = static_cast<const ucontext_t*>(ucontext);
-    const auto* g = uc->uc_mcontext.gregs;
-    const std::uint64_t regs[] = {std::uint64_t(g[REG_RAX]), std::uint64_t(g[REG_RBX]),
-                                  std::uint64_t(g[REG_RCX]), std::uint64_t(g[REG_RDX]),
-                                  std::uint64_t(g[REG_RSI]), std::uint64_t(g[REG_RDI]),
-                                  std::uint64_t(g[REG_R14]), std::uint64_t(g[REG_R15])};
-#endif
-    const char* names[] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r14", "r15"};
     for (int i = 0; i < 8; ++i) {
         std::fprintf(stderr, "Write log: %s=%#llx\n", names[i], (unsigned long long)regs[i]);
     }
