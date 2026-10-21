@@ -52,6 +52,7 @@ private:
     void UpdateCursor();
     u64 last_mouse_motion_ms{}; ///< SDL_GetTicks of the last mouse motion (UpdateCursor)
     bool cursor_hidden{};
+    u64 escape_down_ms{}; ///< SDL_GetTicks when Escape went down, 0 while it is up (hold to quit)
     void CaptureMouse(bool capture);
     std::mutex mouse_mutex;
     double mouse_dx{}, mouse_dy{};

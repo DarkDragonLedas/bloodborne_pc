@@ -238,6 +238,14 @@ bool WindowSDL::PollEvents() {
         }
         if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
             CaptureMouse(false);
+            escape_down_ms = 0;
+        }
+        // Escape held quits the game as the window's close button does; a short press stays the
+        // game's Options button (runtime_pad.c reads the key itself).
+        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_ESCAPE) {
+            escape_down_ms = SDL_GetTicks();
+        } else if (event.type == SDL_EVENT_KEY_UP && event.key.key == SDLK_ESCAPE) {
+            escape_down_ms = 0;
         }
         switch (event.type) {
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
@@ -255,6 +263,15 @@ bool WindowSDL::PollEvents() {
         default:
             break;
         }
+    }
+    constexpr u64 EscapeHoldToQuitMs = 1500;
+    if (escape_down_ms && !SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_ESCAPE]) {
+        escape_down_ms = 0; // its release went to the menu or the name dialog
+    }
+    if (escape_down_ms && SDL_GetTicks() - escape_down_ms >= EscapeHoldToQuitMs) {
+        std::puts("Window: Escape held, quitting");
+        escape_down_ms = 0;
+        is_open = false;
     }
     // The menu, the name dialog and mouse_look=0 want the cursor.
     if (mouse_captured.load(std::memory_order_relaxed) &&
