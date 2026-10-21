@@ -248,7 +248,10 @@ static void *host_start(void *p) {
     GuestThread *t=p;
     attach(t);
     set_host_name(t->name);
-    if (!EXIT_SET(t->exit_jump)) t->result=t->entry(t->argument);
+    const int exited_by_jump=EXIT_SET(t->exit_jump)!=0;
+    if (!exited_by_jump) t->result=t->entry(t->argument);
+    printf("Runtime: guest thread '%s' finished (%s, result=%p)\n",t->name,
+           exited_by_jump ? "pthread_exit" : "returned",t->result);
     runtime_thread_keys_cleanup();
     host_lock(&lock); t->finished=1; ++exited; host_unlock(&lock);
     return t->result;
